@@ -1,0 +1,8 @@
+{
+  "name": "Remix: OmniChat AI",
+  "description": "Advanced multi-provider AI chat client featuring voice input, real-time web search, local file attachments, image/video analysis, custom TTS autoplay, memories, and MCP tool control.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

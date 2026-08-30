@@ -1,0 +1,5 @@
+.git/
+.gradle/
+build/
+node_modules/
+app/src/main/cpp/llama.cpp/

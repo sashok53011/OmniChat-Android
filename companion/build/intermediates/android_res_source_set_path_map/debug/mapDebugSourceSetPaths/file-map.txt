@@ -1,0 +1,7 @@
+com.example.companion-pngs-0 E:\android\omni-chat-ai-gguf\companion\build\generated\res\pngs\debug
+com.example.companion-updated_navigation_xml-1 E:\android\omni-chat-ai-gguf\companion\build\generated\updated_navigation_xml\debug
+com.example.companion-packageDebugResources-2 E:\android\omni-chat-ai-gguf\companion\build\intermediates\incremental\debug\packageDebugResources\merged.dir
+com.example.companion-packageDebugResources-3 E:\android\omni-chat-ai-gguf\companion\build\intermediates\incremental\debug\packageDebugResources\stripped.dir
+com.example.companion-debug-4 E:\android\omni-chat-ai-gguf\companion\build\intermediates\merged_res\debug\mergeDebugResources
+com.example.companion-debug-5 E:\android\omni-chat-ai-gguf\companion\src\debug\res
+com.example.companion-main-6 E:\android\omni-chat-ai-gguf\companion\src\main\res

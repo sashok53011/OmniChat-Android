@@ -1,0 +1,7 @@
+com.example.wear-pngs-0 E:\android\omni-chat-ai-gguf\wear\build\generated\res\pngs\debug
+com.example.wear-updated_navigation_xml-1 E:\android\omni-chat-ai-gguf\wear\build\generated\updated_navigation_xml\debug
+com.example.wear-packageDebugResources-2 E:\android\omni-chat-ai-gguf\wear\build\intermediates\incremental\debug\packageDebugResources\merged.dir
+com.example.wear-packageDebugResources-3 E:\android\omni-chat-ai-gguf\wear\build\intermediates\incremental\debug\packageDebugResources\stripped.dir
+com.example.wear-debug-4 E:\android\omni-chat-ai-gguf\wear\build\intermediates\merged_res\debug\mergeDebugResources
+com.example.wear-debug-5 E:\android\omni-chat-ai-gguf\wear\src\debug\res
+com.example.wear-main-6 E:\android\omni-chat-ai-gguf\wear\src\main\res
