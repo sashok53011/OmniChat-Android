@@ -27,3 +27,6 @@ debug.keystore
 # Build directories
 **/build/
 **/build2/
+
+# Secrets
+**/secrets.h
