@@ -14,6 +14,7 @@
 #include "lwip/sys.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
+#include "esp_sntp.h"
 
 static const char *TAG = "app_wifi";
 static EventGroupHandle_t s_wifi_event_group;
@@ -50,6 +51,16 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         s_connected = true;
         s_retry_count = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+
+        /* Start SNTP so mbedtls can validate TLS certificates (time must not
+         * be 1970 or cert notBefore/notAfter checks will fail with -0x3000). */
+        if (esp_sntp_enabled() != true) {
+            sntp_setoperatingmode(SNTP_OPMODE_POLL);
+            sntp_setservername(0, "pool.ntp.org");
+            sntp_setservername(1, "time.nist.gov");
+            sntp_init();
+            ESP_LOGI(TAG, "SNTP started (polling pool.ntp.org)");
+        }
     }
 }
 

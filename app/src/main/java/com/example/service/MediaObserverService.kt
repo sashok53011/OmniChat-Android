@@ -42,6 +42,10 @@ class MediaObserverService : Service() {
     private var observerStartTime: Long = 0L
     private var lastObservedMediaUri: Uri? = null
     private var lastObservedMediaTime: Long = 0L
+    private val processedImageHashes = mutableSetOf<String>()
+
+    private val imageQueue = java.util.concurrent.ConcurrentLinkedQueue<Uri>()
+    @Volatile private var isProcessing = false
 
     private lateinit var repository: AppRepository
 
@@ -223,11 +227,43 @@ class MediaObserverService : Service() {
                 if (fileAddedTimeMs >= observerStartTime - 5000) {
                     val now = System.currentTimeMillis()
                     if (latestUri != lastObservedMediaUri && now - lastObservedMediaTime > 4000) {
+                        // MD5 hash dedup: skip if same image content was already processed
+                        try {
+                            val inputStream = contentResolver.openInputStream(latestUri)
+                            val imageBytes = inputStream?.use { it.readBytes() } ?: return@launch
+                            val imageHash = java.security.MessageDigest.getInstance("MD5")
+                                .digest(imageBytes).joinToString("") { "%02x".format(it) }
+                            if (imageHash in processedImageHashes) {
+                                Log.d(TAG, "Skipping duplicate image (hash=$imageHash)")
+                                return@launch
+                            }
+                            processedImageHashes.add(imageHash)
+                            if (processedImageHashes.size > 50) {
+                                processedImageHashes.iterator().let { iter -> repeat(25) { iter.next(); iter.remove() } }
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Error checking image hash", e)
+                        }
+
                         lastObservedMediaUri = latestUri
                         lastObservedMediaTime = now
-                        processNewImageAndPostNotification(latestUri)
+                        imageQueue.offer(latestUri)
+                        if (!isProcessing) processNextFromQueue()
                     }
                 }
+            }
+        }
+    }
+
+    private fun processNextFromQueue() {
+        val next = imageQueue.poll() ?: return
+        isProcessing = true
+        serviceScope.launch {
+            try {
+                processNewImageAndPostNotification(next)
+            } finally {
+                isProcessing = false
+                processNextFromQueue()
             }
         }
     }
@@ -245,7 +281,8 @@ class MediaObserverService : Service() {
                     if (uri != lastObservedMediaUri && now - lastObservedMediaTime > 4000) {
                         lastObservedMediaUri = uri
                         lastObservedMediaTime = now
-                        processNewImageAndPostNotification(uri)
+                        imageQueue.offer(uri)
+                        if (!isProcessing) processNextFromQueue()
                     }
                 }
             }
@@ -296,8 +333,11 @@ class MediaObserverService : Service() {
                 webSearchEnabled = false
             )
 
-            // 4. Save response message in DB
-            repository.insertMessage(responseMsg)
+            // 4. Auto-post to WordPress
+            val wpAutoPost = repository.getSettingValue("wp_auto_post", "false")
+            if (wpAutoPost == "true") {
+                repository.postChatToWordPress(sessionId)
+            }
 
             // 5. Post Statusbar Notification
             NotificationHelper.postChatNotification(

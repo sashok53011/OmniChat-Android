@@ -1,17 +1,20 @@
 /*
  * ui_main.c - top-level OmniChat-P4 UI: navigation + screen switching.
  *
- * LVGL runs in a single task (main.c calls lv_timer_handler). The engine listener
- * runs on a worker thread; we marshal refreshes via an event group and apply them
- * inside ui_pump() (called from the LVGL loop).
+ * LVGL runs in the esp_lv_adapter worker task (main.c never calls
+ * lv_timer_handler). The engine listener runs on a worker thread; we marshal
+ * refreshes via an event group and apply them inside ui_pump(), which is driven
+ * by an LVGL timer (lv_timer_create) that fires within lv_timer_handler.
  */
 #include <stdlib.h>
 #include <string.h>
 #include "esp_log.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "lvgl.h"
+#include "esp_lv_adapter.h"
 #include "chat_engine.h"
 #include "app_config.h"
 #include "ui_main.h"
@@ -44,6 +47,15 @@ void ui_go_screen(const char *screen)
 void ui_refresh(void)
 {
     if (s_ui_events) xEventGroupSetBits(s_ui_events, UI_EVENT_REFRESH);
+}
+
+/* LVGL timer callback (created in ui_init). Called by esp_lv_adapter's worker
+ * inside lv_timer_handler(), i.e. from the LVGL thread - safe to touch widgets.
+ * Runs at 20 ms; ui_pump() keeps the heavier WiFi status update at 1 s. */
+static void ui_pump_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    ui_pump();
 }
 
 /* Add a bottom navigation bar to a screen. */
@@ -120,6 +132,14 @@ void ui_init(lv_display_t *disp)
     lv_screen_load(s_screen_chat);
     s_current = "chat";
     ESP_LOGI(TAG, "UI initialized");
+
+    /* Periodic pump owned by the LVGL loop (runs inside lv_timer_handler of
+     * the adapter worker): engine-event refresh + 1 s WiFi status. */
+    lv_timer_create(ui_pump_cb, 20, NULL);
+
+#if CONFIG_ESP_LVGL_ADAPTER_ENABLE_FPS_STATS
+    esp_lv_adapter_fps_stats_enable(s_disp, true);
+#endif
 }
 
 void ui_pump(void)
@@ -139,5 +159,27 @@ void ui_pump(void)
     if (now - last_status >= 1000) {
         last_status = now;
         ui_chat_update_status();
+    }
+
+    /* Diagnostic dump every ~15 s: per-task CPU%, LVGL FPS, free heap.
+     * Only compiled when the supporting FreeRTOS / adapter options are on. */
+    static uint32_t last_diag = 0;
+    if (now >= 30000 && now - last_diag >= 15000) {
+        last_diag = now;
+#if CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS
+        char *buf = malloc(2048);
+        if (buf) {
+            vTaskGetRunTimeStats(buf);
+            ESP_LOGW(TAG, "--- CPU stats ---\n%s\nheap free: %u",
+                     buf, (unsigned)esp_get_free_heap_size());
+            free(buf);
+        }
+#endif
+#if CONFIG_ESP_LVGL_ADAPTER_ENABLE_FPS_STATS
+        uint32_t fps = 0;
+        if (esp_lv_adapter_get_fps(s_disp, &fps) == ESP_OK) {
+            ESP_LOGW(TAG, "LVGL FPS: %u", (unsigned)fps);
+        }
+#endif
     }
 }

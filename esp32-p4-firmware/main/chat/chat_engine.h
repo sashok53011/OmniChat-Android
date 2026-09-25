@@ -39,6 +39,12 @@ int chat_engine_delete_session(const char *id);
 /* Send a user message: appends to session, runs the pipeline in a worker task. */
 int chat_engine_send_user(const char *text, int web_search_enabled);
 
+/* Retry the last exchange: removes the last user+assistant pair and re-sends. */
+int chat_engine_retry_last(void);
+
+/* Delete all messages in the active session (keeps the session itself). */
+int chat_engine_clear_active(void);
+
 /* Append a message directly (e.g. from HTTP /text push). */
 int chat_engine_push_message(msg_role_t role, const char *text);
 

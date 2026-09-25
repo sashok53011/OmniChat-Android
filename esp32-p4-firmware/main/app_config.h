@@ -1,31 +1,47 @@
 /*
  * app_config.h - OmniChat-P4 firmware configuration
  *
- * Hard-coded defaults. This is a personal, single-user device, so secrets are
- * baked in as defaults. They are editable at runtime in Settings and persisted
- * to SPIFFS; the values below are only the initial seed.
+ * Build defaults. Secrets (WiFi credentials, API keys) come from main/secrets.h,
+ * which is NOT committed — copy secrets.h.example to secrets.h and fill it in.
+ * All values are editable at runtime in Settings and persisted to SPIFFS; the
+ * values here are only the initial seed.
  */
 #ifndef APP_CONFIG_H
 #define APP_CONFIG_H
 
-/* -------- WiFi (hard-coded) -------- */
-#define APP_WIFI_SSID       "Vodafone-6E42"
-#define APP_WIFI_PASSWORD   "A521931p!"
+/* -------- Secrets --------
+ * Real values live in main/secrets.h, which is NOT committed (see .gitignore).
+ * Copy secrets.h.example to secrets.h and fill it in.
+ */
+#if defined(__has_include)
+#  if __has_include("secrets.h")
+#    include "secrets.h"
+#  endif
+#endif
 
-/* -------- LLM providers (only opencode.ai + ollama cloud) -------- */
+/* -------- WiFi -------- */
+#ifndef APP_WIFI_SSID
+#  define APP_WIFI_SSID       "CHANGE_ME_SSID"
+#endif
+#ifndef APP_WIFI_PASSWORD
+#  define APP_WIFI_PASSWORD   "CHANGE_ME_PASSWORD"
+#endif
+/* -------- LLM providers (opencode.ai, Ollama LAN, LM Studio) -------- */
 #define PROVIDER_OPENCODE_ID       "opencode"
 #define PROVIDER_OPENCODE_NAME     "opencode.ai"
 #define PROVIDER_OPENCODE_BASE_URL "https://opencode.ai/zen/go/v1/"
-#define PROVIDER_OPENCODE_API_KEY  "sk-nAgoe9M2uWgJLUL217j5vZ8xUhHo1zPd3Nju9b8ff49ygXjq2gvAFdlczo50Nsle"
+#ifndef PROVIDER_OPENCODE_API_KEY
+#  define PROVIDER_OPENCODE_API_KEY  "CHANGE_ME_API_KEY"
+#endif
 #define PROVIDER_OPENCODE_MODEL    "mimo-v2.5"
 #define PROVIDER_OPENCODE_PRIORITY 0
 
-#define PROVIDER_OLLAMA_ID         "ollama_cloud"
-#define PROVIDER_OLLAMA_NAME       "Ollama Cloud"
-#define PROVIDER_OLLAMA_BASE_URL   "https://ollama.com/v1/"
-#define PROVIDER_OLLAMA_API_KEY    ""
-#define PROVIDER_OLLAMA_MODEL      "llama3"
-#define PROVIDER_OLLAMA_PRIORITY   1
+#define PROVIDER_LM_STUDIO_ID       "lm_studio"
+#define PROVIDER_LM_STUDIO_NAME     "LM Studio"
+#define PROVIDER_LM_STUDIO_BASE_URL "http://192.168.0.133:1234/v1/"
+#define PROVIDER_LM_STUDIO_API_KEY  ""
+#define PROVIDER_LM_STUDIO_MODEL    "qwen3-vl-4b-instruct-1m"
+#define PROVIDER_LM_STUDIO_PRIORITY 1
 
 #define PROVIDER_LAN_ID           "ollama_lan"
 #define PROVIDER_LAN_NAME         "Ollama LAN"
@@ -65,8 +81,8 @@
 #define APP_AUDIO_VOLUME_DEFAULT 60
 
 /* UI font choices (Montserrat included in LVGL compile) */
-#define APP_FONT_BODY      &lv_font_montserrat_16
-#define APP_FONT_BODY_LG   &lv_font_montserrat_20
+#define APP_FONT_BODY      &lv_font_montserrat_20
+#define APP_FONT_BODY_LG   &lv_font_montserrat_24
 #define APP_FONT_TITLE     &lv_font_montserrat_24
 
 #endif /* APP_CONFIG_H */

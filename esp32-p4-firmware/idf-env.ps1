@@ -21,7 +21,14 @@ $toolPath = ""
 foreach ($line in $exportOut) {
     if ($line -like "PATH=*") {
         $toolPath = $line.Substring(5).Replace(";%PATH%", "")
-        break
+    }
+    elseif ($line -like "*=*") {
+        $eq = $line.IndexOf('=')
+        if ($eq -gt 0) {
+            $key = $line.Substring(0, $eq)
+            $val = $line.Substring($eq + 1)
+            [System.Environment]::SetEnvironmentVariable($key, $val, "Process")
+        }
     }
 }
 

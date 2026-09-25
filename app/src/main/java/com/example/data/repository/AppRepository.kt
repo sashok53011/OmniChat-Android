@@ -24,6 +24,11 @@ import java.util.concurrent.TimeUnit
 class AppRepository(private val appDao: AppDao, private val context: Context) {
     private val TAG = "AppRepository"
 
+    companion object {
+        private var lastPostTime = 0L
+        private const val POST_DEBOUNCE_MS = 10_000L
+    }
+
     // --- Database Flows ---
     val allSessions: Flow<List<ChatSession>> = appDao.getAllSessions()
     val allProviders: Flow<List<AiProvider>> = appDao.getAllProvidersFlow()
@@ -73,6 +78,16 @@ class AppRepository(private val appDao: AppDao, private val context: Context) {
                 modelName = "llama3",
                 isEnabled = true,
                 priority = 1
+            ),
+            AiProvider(
+                id = "devhorizon_qwen3_vl",
+                name = "DevHorizon Qwen3 VL",
+                type = "OPENAI_COMPATIBLE",
+                baseUrl = "https://llm.devhorizon.online:1234/v1",
+                apiKey = "",
+                modelName = "qwen3-vl-4b-instruct-1m",
+                isEnabled = true,
+                priority = 2
             ),
             AiProvider(
                 id = "local_gguf",
@@ -175,7 +190,13 @@ class AppRepository(private val appDao: AppDao, private val context: Context) {
     ): WpMediaResult? {
         return try {
             val inputStream = context.contentResolver.openInputStream(uri) ?: return null
-            val bytes = inputStream.use { it.readBytes() }
+            val rawBytes = inputStream.use { it.readBytes() }
+
+            val bytes = if (mimeType.startsWith("image/") && !mimeType.contains("gif")) {
+                fixImageOrientation(rawBytes)
+            } else {
+                rawBytes
+            }
 
             val requestBody = okhttp3.RequestBody.create(
                 mimeType.toMediaType(),
@@ -209,6 +230,90 @@ class AppRepository(private val appDao: AppDao, private val context: Context) {
             Log.e(TAG, "Error uploading media to WordPress", e)
             null
         }
+    }
+
+    private fun fixImageOrientation(jpegBytes: ByteArray): ByteArray {
+        return try {
+            val exif = androidx.exifinterface.media.ExifInterface(jpegBytes.inputStream())
+            val orientation = exif.getAttributeInt(
+                androidx.exifinterface.media.ExifInterface.TAG_ORIENTATION,
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL
+            )
+            Log.d(TAG, "EXIF orientation: $orientation (NORMAL=1, ROTATE_90=6, ROTATE_180=3, ROTATE_270=8)")
+
+            if (orientation == androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL ||
+                orientation == androidx.exifinterface.media.ExifInterface.ORIENTATION_UNDEFINED) {
+                return jpegBytes
+            }
+
+            val bitmap = android.graphics.BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+                ?: return jpegBytes
+
+            // Check if BitmapFactory already applied EXIF rotation
+            val needsRotation = when (orientation) {
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_90,
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_270,
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_TRANSPOSE,
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_TRANSVERSE -> {
+                    // After rotation, width > height (landscape). If already landscape, skip.
+                    bitmap.width > bitmap.height
+                }
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_180,
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_FLIP_HORIZONTAL,
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_FLIP_VERTICAL -> false
+                else -> false
+            }
+
+            if (needsRotation) {
+                Log.d(TAG, "Skipping rotation - BitmapFactory already applied EXIF (w=${bitmap.width}, h=${bitmap.height})")
+                bitmap.recycle()
+                return jpegBytes
+            }
+
+            val matrix = android.graphics.Matrix()
+            when (orientation) {
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.preScale(-1f, 1f)
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.preScale(1f, -1f)
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_TRANSPOSE -> {
+                    matrix.postRotate(90f)
+                    matrix.preScale(-1f, 1f)
+                }
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_TRANSVERSE -> {
+                    matrix.postRotate(270f)
+                    matrix.preScale(-1f, 1f)
+                }
+                else -> return jpegBytes
+            }
+
+            Log.d(TAG, "Applying EXIF rotation for orientation=$orientation")
+            val rotated = android.graphics.Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+            if (rotated !== bitmap) bitmap.recycle()
+
+            val output = java.io.ByteArrayOutputStream()
+            rotated.compress(android.graphics.Bitmap.CompressFormat.JPEG, 92, output)
+            rotated.recycle()
+            output.toByteArray()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error fixing image orientation, using raw bytes", e)
+            jpegBytes
+        }
+    }
+
+    private fun calculateTextOverlap(a: String, b: String): Float {
+        if (a.isEmpty() || b.isEmpty()) return 0f
+        val shorter = if (a.length <= b.length) a else b
+        val longer = if (a.length > b.length) a else b
+        var matches = 0
+        val windowSize = 50
+        for (i in 0..(shorter.length - windowSize).coerceAtLeast(0) step windowSize) {
+            val chunk = shorter.substring(i, (i + windowSize).coerceAtMost(shorter.length))
+            if (longer.contains(chunk)) matches++
+        }
+        val totalChunks = ((shorter.length - windowSize).coerceAtLeast(0) / windowSize) + 1
+        return if (totalChunks > 0) matches.toFloat() / totalChunks else 0f
     }
 
     private fun markdownToHtml(text: String): String {
@@ -252,9 +357,25 @@ class AppRepository(private val appDao: AppDao, private val context: Context) {
 
     suspend fun postChatToWordPress(sessionId: Long): Boolean = withContext(Dispatchers.IO) {
         try {
+            val now = System.currentTimeMillis()
+            if (now - lastPostTime < POST_DEBOUNCE_MS) {
+                Log.d(TAG, "Skipping WordPress post (debounce: ${now - lastPostTime}ms since last post)")
+                return@withContext false
+            }
+            lastPostTime = now
+
             val session = appDao.getSessionById(sessionId) ?: return@withContext false
-            val messages = appDao.getMessagesForSessionSync(sessionId)
-            
+            val allMessages = appDao.getMessagesForSessionSync(sessionId)
+
+            // Only post the last exchange (last user + last model), prefer user message with media
+            val lastUserWithMedia = allMessages.indexOfLast { it.role == "user" && it.mediaUri != null }
+            val lastUserIdx = if (lastUserWithMedia >= 0) lastUserWithMedia else allMessages.indexOfLast { it.role == "user" }
+            val lastModelIdx = allMessages.indexOfLast { it.role == "model" }
+            val messages = mutableListOf<ChatMessage>()
+            if (lastUserIdx >= 0) messages.add(allMessages[lastUserIdx])
+            if (lastModelIdx >= 0) messages.add(allMessages[lastModelIdx])
+            if (messages.isEmpty()) return@withContext false
+
             val wpUrl = getSettingValue("wp_url", "").trimEnd('/')
             val wpUser = getSettingValue("wp_user", "")
             val wpAppPass = getSettingValue("wp_app_pass", "")
@@ -283,13 +404,16 @@ class AppRepository(private val appDao: AppDao, private val context: Context) {
                     append("<b>${msg.role.uppercase()}:</b><br>")
 
                     if (msg.mediaUri != null && msg.mediaType == "image" && msg.mediaUri !in mediaAddedToContent) {
-                        val cachedUrl = mediaCache[msg.mediaUri]
-                        if (cachedUrl != null) {
-                            append("<img src=\"$cachedUrl\" style=\"max-width:100%;height:auto;border-radius:8px;\" /><br>")
-                            mediaAddedToContent.add(msg.mediaUri)
-                        } else {
-                            try {
-                                val uri = Uri.parse(msg.mediaUri)
+                        try {
+                            val uri = Uri.parse(msg.mediaUri)
+                            val inputStream = context.contentResolver.openInputStream(uri) ?: return@forEach
+                            inputStream.use { it.readBytes() }
+
+                            val cachedUrl = mediaCache[msg.mediaUri]
+                            if (cachedUrl != null) {
+                                append("<img src=\"$cachedUrl\" style=\"max-width:100%;height:auto;border-radius:8px;\" /><br>")
+                                mediaAddedToContent.add(msg.mediaUri)
+                            } else {
                                 val mimeType = context.contentResolver.getType(uri) ?: "image/jpeg"
                                 val ext = mimeType.substringAfterLast("/")
                                 val fileName = "chat_${msg.id}_${System.currentTimeMillis()}.$ext"
@@ -301,9 +425,9 @@ class AppRepository(private val appDao: AppDao, private val context: Context) {
                                     if (featuredMediaId == null) featuredMediaId = uploadResult.mediaId
                                     Log.d(TAG, "Uploaded media to WordPress: ${uploadResult.url}")
                                 }
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Failed to upload media: ${msg.mediaUri}", e)
                             }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Failed to upload media: ${msg.mediaUri}", e)
                         }
                     } else if (msg.mediaUri != null && msg.mediaType == "video") {
                         val cachedUrl = mediaCache[msg.mediaUri]
@@ -333,10 +457,30 @@ class AppRepository(private val appDao: AppDao, private val context: Context) {
             }
 
             val json = JSONObject().apply {
-                put("title", java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date()))
+                val firstModelMsg = messages.firstOrNull { it.role == "model" && it.text.isNotBlank() }
+                val topics = Regex("Aufgabe\\s+\\d+[a-zA-Z]?", RegexOption.IGNORE_CASE)
+                    .findAll(firstModelMsg?.text ?: "")
+                    .map { it.value.trim() }
+                    .distinct()
+                    .take(4)
+                    .toList()
+                val rawTitle = if (topics.isNotEmpty()) {
+                    topics.joinToString(", ")
+                } else {
+                    firstModelMsg?.text
+                        ?.replace(Regex("[#*`\\[\\]]"), "")
+                        ?.replace(Regex("\\n+"), " ")
+                        ?.trim()
+                        ?.take(60)
+                        ?.trim()
+                        ?: "OmniChat Post"
+                }
+                val dateTimeStr = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US)
+                    .format(java.util.Date())
+                put("title", "$rawTitle [$dateTimeStr]")
                 put("content", chatContent)
                 put("status", "publish")
-                put("slug", java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date()))
+                put("slug", java.text.SimpleDateFormat("yyyy-MM-dd_HHmmss", java.util.Locale.US).format(java.util.Date()))
                 if (featuredMediaId != null) {
                     put("featured_media", featuredMediaId!!)
                 }
@@ -354,11 +498,12 @@ class AppRepository(private val appDao: AppDao, private val context: Context) {
                 .build()
 
             client.newCall(request).execute().use { response ->
+                val responseBody = response.body?.string() ?: ""
                 if (response.isSuccessful) {
-                    Log.d(TAG, "Successfully posted to WordPress with ${mediaCache.size} media items")
+                    Log.d(TAG, "Successfully posted to WordPress with ${mediaCache.size} media items. Response: $responseBody")
                     true
                 } else {
-                    Log.e(TAG, "Failed to post to WordPress: ${response.code} ${response.message}")
+                    Log.e(TAG, "Failed to post to WordPress: ${response.code} ${response.message} | $responseBody")
                     false
                 }
             }
@@ -819,15 +964,6 @@ class AppRepository(private val appDao: AppDao, private val context: Context) {
                             attachments = attachments
                         )
                     }
-                    "LOCAL_GGUF" -> {
-                        generateLocalGgufResponse(
-                            provider = provider,
-                            prompt = userMessageText,
-                            attachments = attachments,
-                            history = apiMessages,
-                            onStatusUpdate = onStatusUpdate
-                        )
-                    }
                     "REMOTE_MCP" -> {
                         ApiClient.callRemoteMcp(
                             context = context,
@@ -880,6 +1016,180 @@ class AppRepository(private val appDao: AppDao, private val context: Context) {
             role = "model",
             text = responseText,
             isWebResult = webSearchEnabled
+        )
+        val msgId = appDao.insertMessage(responseMessage)
+        return@withContext responseMessage.copy(id = msgId)
+    }
+
+    // --- STREAMING CHAT CALL ---
+    suspend fun sendChatMessageStreaming(
+        sessionId: Long,
+        userMessageText: String,
+        providerId: String,
+        attachments: List<Uri> = emptyList(),
+        webSearchEnabled: Boolean = false,
+        onStatusUpdate: (String) -> Unit = {},
+        onTokenReceived: (String) -> Unit = {},
+        briefMode: Boolean = false
+    ): ChatMessage = withContext(Dispatchers.IO) {
+        val history = appDao.getMessagesForSessionSync(sessionId)
+        val memories = appDao.getAllMemoryItemsSync()
+        val session = appDao.getSessionById(sessionId)
+        val customSystemPrompt = session?.systemPrompt ?: getSettingValue("system_prompt", "You are OmniChat AI.")
+        val appLang = getSettingValue("app_language", "ru")
+        val systemInstruction = buildString {
+            append(customSystemPrompt)
+            if (memories.isNotEmpty()) {
+                append("\n\n[User Memories & Long-term Preferences]:")
+                memories.forEach { item -> append("\n- ${item.content}") }
+            }
+            append("\n\nPlease adapt your responses based on these preferences and facts if relevant.")
+            val langInstruction = when (appLang) {
+                "ru" -> "\n\nIMPORTANT: Regardless of previous context or input language, you MUST respond entirely in Russian (Русский язык)."
+                "de" -> "\n\nIMPORTANT: Regardless of previous context or input language, you MUST respond entirely in German (Deutsch)."
+                else -> "\n\nIMPORTANT: Regardless of previous context or input language, you MUST respond entirely in English."
+            }
+            append(langInstruction)
+            if (briefMode) {
+                append("\n\nCRITICAL: This message was sent by voice input. Reply with ONLY 1-2 short sentences maximum. Be concise and direct. No lists, no code blocks, no markdown formatting. Just a quick, helpful answer.")
+            }
+        }
+
+        var enrichedUserText = userMessageText
+        if (webSearchEnabled) {
+            onStatusUpdate("Searching the web...")
+            val searchResults = ApiClient.queryWebSearch(userMessageText)
+            if (searchResults.isNotBlank() && !searchResults.startsWith("Web Search Failed")) {
+                enrichedUserText = buildString {
+                    append("[Real-time Web Search Results for \"$userMessageText\"]:\n")
+                    append(searchResults)
+                    append("\n\n[User Prompt]:\n")
+                    append(userMessageText)
+                    append("\n\nPlease write an advanced, thorough response using the web search results above. Include citations if applicable.")
+                }
+                onStatusUpdate("Synthesizing results...")
+            } else {
+                onStatusUpdate("Search returned no results. Proceeding with standard generation...")
+            }
+        } else {
+            onStatusUpdate("Thinking...")
+        }
+
+        val apiMessages = history.toMutableList()
+        if (apiMessages.isNotEmpty() && apiMessages.last().role == "user") {
+            val last = apiMessages.removeAt(apiMessages.lastIndex)
+            apiMessages.add(last.copy(text = enrichedUserText))
+        }
+
+        val allEnabledProviders = appDao.getAllProviders().filter { it.isEnabled }
+        val primaryProvider = allEnabledProviders.find { it.id == providerId }
+            ?: allEnabledProviders.firstOrNull()
+            ?: throw Exception("No enabled AI providers found in the database. Please add one in settings.")
+
+        val fallbackChain = mutableListOf<AiProvider>()
+        fallbackChain.add(primaryProvider)
+        fallbackChain.addAll(allEnabledProviders.filter { it.id != primaryProvider.id })
+
+        var responseText = ""
+        var successProvider: AiProvider? = null
+        var lastError: Exception? = null
+
+        for (provider in fallbackChain) {
+            try {
+                Log.d(TAG, "Attempting streaming with provider: ${provider.name} (${provider.modelName})")
+                onStatusUpdate("Streaming using ${provider.name}...")
+
+                if (provider.type == "OPENAI_COMPATIBLE" || provider.type == "LOCAL_GGUF" || provider.type == "REMOTE_MCP") {
+                    val streamFlow = ApiClient.callOpenAiStreaming(
+                        context = context,
+                        baseUrl = provider.baseUrl,
+                        apiKey = provider.apiKey,
+                        modelName = provider.modelName,
+                        messages = apiMessages,
+                        systemInstruction = systemInstruction,
+                        attachments = attachments
+                    )
+
+                    // Insert placeholder message immediately
+                    val placeholder = ChatMessage(
+                        sessionId = sessionId,
+                        role = "model",
+                        text = "",
+                        isWebResult = webSearchEnabled
+                    )
+                    val msgId = appDao.insertMessage(placeholder)
+                    onStatusUpdate("")
+
+                    val buffer = StringBuilder()
+                    try {
+                        streamFlow.collect { delta ->
+                            buffer.append(delta)
+                            responseText = buffer.toString()
+                            onTokenReceived(responseText)
+                            // Update DB every 3 tokens to avoid excessive writes
+                            if (buffer.length % 3 == 0 || delta.contains("\n")) {
+                                appDao.updateMessageText(msgId, responseText)
+                            }
+                        }
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        if (responseText.isNotBlank()) {
+                            appDao.updateMessageText(msgId, responseText)
+                            Log.d(TAG, "Streaming cancelled, saved partial response (${responseText.length} chars)")
+                        } else {
+                            appDao.deleteMessage(placeholder.copy(id = msgId))
+                        }
+                        throw e
+                    }
+                    // Final DB update with complete text
+                    appDao.updateMessageText(msgId, responseText)
+                    successProvider = provider
+
+                    if (successProvider.id != providerId) {
+                        val currentSession = appDao.getSessionById(sessionId)
+                        if (currentSession != null) {
+                            appDao.updateSession(currentSession.copy(activeProviderId = successProvider.id))
+                        }
+                    }
+
+                    return@withContext appDao.getMessagesForSessionSync(sessionId).lastOrNull()
+                        ?: placeholder.copy(id = msgId, text = responseText)
+                } else {
+                    // Non-streamable provider: fall back to blocking call
+                    responseText = when (provider.type) {
+                        "GEMINI" -> ApiClient.callGemini(
+                            context = context, modelName = provider.modelName, apiKey = provider.apiKey,
+                            messages = apiMessages, systemInstruction = systemInstruction, attachments = attachments
+                        )
+                        else -> ApiClient.callOpenAi(
+                            context = context, baseUrl = provider.baseUrl, apiKey = provider.apiKey,
+                            modelName = provider.modelName, messages = apiMessages,
+                            systemInstruction = systemInstruction, attachments = attachments
+                        )
+                    }
+                    successProvider = provider
+                    break
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Provider ${provider.name} streaming failed", e)
+                lastError = e
+            }
+        }
+
+        if (successProvider == null) {
+            throw lastError ?: Exception("All AI providers failed to generate a response.")
+        }
+
+        if (responseText.isEmpty()) {
+            val responseMessage = ChatMessage(
+                sessionId = sessionId, role = "model", text = responseText, isWebResult = webSearchEnabled
+            )
+            val msgId = appDao.insertMessage(responseMessage)
+            return@withContext responseMessage.copy(id = msgId)
+        }
+
+        // If non-streaming path, save to DB
+        val responseMessage = ChatMessage(
+            sessionId = sessionId, role = "model", text = responseText, isWebResult = webSearchEnabled
         )
         val msgId = appDao.insertMessage(responseMessage)
         return@withContext responseMessage.copy(id = msgId)

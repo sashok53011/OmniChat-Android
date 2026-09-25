@@ -686,6 +686,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application), T
     private val _isGenerating = MutableStateFlow(false)
     val isGenerating: StateFlow<Boolean> = _isGenerating.asStateFlow()
 
+    // Streaming state — holds in-progress text for the current streaming response
+    private val _streamingText = MutableStateFlow("")
+    val streamingText: StateFlow<String> = _streamingText.asStateFlow()
+
+    private val _isStreamingActive = MutableStateFlow(false)
+    val isStreamingActive: StateFlow<Boolean> = _isStreamingActive.asStateFlow()
+
+    private var streamingJob: kotlinx.coroutines.Job? = null
+
     private val _currentlySpeakingText = MutableStateFlow<String?>(null)
     val currentlySpeakingText: StateFlow<String?> = _currentlySpeakingText.asStateFlow()
 
@@ -1260,8 +1269,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application), T
         _attachments.value = emptyList()
     }
 
+    // --- Stop Generation ---
+    fun stopGeneration() {
+        streamingJob?.cancel()
+        streamingJob = null
+        _isStreamingActive.value = false
+        _streamingText.value = ""
+        _isGenerating.value = false
+        _statusText.value = ""
+    }
+
     // --- Main Messaging Action ---
     fun sendMessage(text: String) {
+        if (_isGenerating.value) return
         val sessionId = _currentSessionId.value ?: return
         if (text.isBlank() && _attachments.value.isEmpty()) return
 
@@ -1272,7 +1292,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application), T
         val isVoiceOriginated = voiceBriefMode
         voiceBriefMode = false // reset after capturing
 
-        viewModelScope.launch {
+        streamingJob = viewModelScope.launch {
             try {
                 // Determine active provider from session
                 val sessions = chatSessions.value
@@ -1315,16 +1335,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application), T
                     }
                 }
 
-                // 3. Make LLM fall-back request
-                val responseMessage = repository.sendChatMessageWithFallback(
+                // 3. Make LLM fall-back request (streaming)
+                _streamingText.value = ""
+                _isStreamingActive.value = true
+                val responseMessage = repository.sendChatMessageStreaming(
                     sessionId = sessionId,
                     userMessageText = text,
                     providerId = providerId,
                     attachments = attachmentsCopy,
                     webSearchEnabled = _webSearchEnabled.value,
                     onStatusUpdate = { _statusText.value = it },
+                    onTokenReceived = { fullText -> _streamingText.value = fullText },
                     briefMode = isVoiceOriginated
                 )
+                _isStreamingActive.value = false
+                _streamingText.value = ""
 
                 // 4. TTS Autoplay
                 if (_ttsAutoplay.value) {
@@ -1368,6 +1393,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application), T
                 )
             } finally {
                 _isGenerating.value = false
+                _isStreamingActive.value = false
+                _streamingText.value = ""
                 _statusText.value = ""
                 // Drain voice message queue — send next queued message
                 drainVoiceQueue()
@@ -1394,7 +1421,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application), T
         _customSuggestions.value = emptyList()
         _statusText.value = "Regenerating response..."
 
-        viewModelScope.launch {
+        streamingJob = viewModelScope.launch {
             try {
                 // 1. Get the current list of messages
                 val messages = currentMessages.value
@@ -1429,15 +1456,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application), T
 
                 ensureGgufLoadedIfSelected(providerId)
 
-                // 4. Trigger regenerate fallback call (without re-inserting user message)
-                val responseMessage = repository.sendChatMessageWithFallback(
+                // 4. Trigger regenerate fallback call (streaming)
+                _streamingText.value = ""
+                _isStreamingActive.value = true
+                val responseMessage = repository.sendChatMessageStreaming(
                     sessionId = sessionId,
                     userMessageText = userText,
                     providerId = providerId,
                     attachments = emptyList(),
                     webSearchEnabled = _webSearchEnabled.value,
-                    onStatusUpdate = { _statusText.value = it }
+                    onStatusUpdate = { _statusText.value = it },
+                    onTokenReceived = { fullText -> _streamingText.value = fullText }
                 )
+                _isStreamingActive.value = false
+                _streamingText.value = ""
 
                 // 5. TTS Autoplay if enabled
                 if (_ttsAutoplay.value) {
@@ -1475,6 +1507,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application), T
                 )
             } finally {
                 _isGenerating.value = false
+                _isStreamingActive.value = false
+                _streamingText.value = ""
                 _statusText.value = ""
             }
         }
@@ -1782,78 +1816,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application), T
         com.example.service.MediaObserverService.startService(getApplication())
 
         observerStartTime = System.currentTimeMillis()
-        Log.d(TAG, "Media observers registered at: $observerStartTime")
+        Log.d(TAG, "Media observation started at: $observerStartTime")
 
         val context = getApplication<Application>()
 
-        // 1. Setup Gallery ContentObserver
-        try {
-            val handler = Handler(Looper.getMainLooper())
-            
-            galleryImagesObserver = object : ContentObserver(handler) {
-                override fun onChange(selfChange: Boolean, uri: Uri?) {
-                    super.onChange(selfChange, uri)
-                    handleNewMediaDetected()
-                }
-            }
-            
-            galleryVideosObserver = object : ContentObserver(handler) {
-                override fun onChange(selfChange: Boolean, uri: Uri?) {
-                    super.onChange(selfChange, uri)
-                    handleNewMediaDetected()
-                }
-            }
-
-            context.contentResolver.registerContentObserver(
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                true,
-                galleryImagesObserver!!
-            )
-            
-            context.contentResolver.registerContentObserver(
-                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                true,
-                galleryVideosObserver!!
-            )
-            Log.d(TAG, "Successfully registered gallery ContentObservers")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error registering gallery ContentObservers", e)
-        }
-
-        // 2. Setup Custom Folder Observer
-        val customPath = _observeMediaFolder.value
-        if (customPath.isNotBlank()) {
-            val folder = java.io.File(customPath)
-            if (folder.exists() && folder.isDirectory) {
-                try {
-                    val flags = FileObserver.CREATE or FileObserver.CLOSE_WRITE
-                    folderFileObserver = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        object : FileObserver(folder, flags) {
-                            override fun onEvent(event: Int, path: String?) {
-                                if (path != null) {
-                                    handleCustomFolderNewFile(java.io.File(folder, path))
-                                }
-                            }
-                        }
-                    } else {
-                        @Suppress("DEPRECATION")
-                        object : FileObserver(customPath, flags) {
-                            override fun onEvent(event: Int, path: String?) {
-                                if (path != null) {
-                                    handleCustomFolderNewFile(java.io.File(customPath, path))
-                                }
-                            }
-                        }
-                    }
-                    folderFileObserver?.startWatching()
-                    Log.d(TAG, "Successfully started watching custom folder: $customPath")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error starting FileObserver for path $customPath", e)
-                }
-            } else {
-                Log.w(TAG, "Observed folder path does not exist or is not a directory: $customPath")
-            }
-        }
+        // All media observation (ContentObservers + FileObservers) handled by MediaObserverService only
     }
 
     fun unregisterMediaObservers() {

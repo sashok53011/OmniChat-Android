@@ -65,6 +65,25 @@ static void notify(void)
     if (s_listener) s_listener();
 }
 
+/* Keep the in-memory session list in sync with the active session, which is
+ * where new/changed messages accumulate at runtime. Without this, switching
+ * away and back to a session would restore a stale snapshot from s_sessions
+ * and the latest messages would seem to disappear. */
+static void sync_active_to_list(void)
+{
+    if (!s_active_loaded || s_active.id[0] == '\0') {
+        return;
+    }
+    for (int i = 0; i < s_session_count; i++) {
+        if (strcmp(s_sessions[i].id, s_active.id) == 0) {
+            chat_session_free(&s_sessions[i]);
+            memset(&s_sessions[i], 0, sizeof(s_sessions[i]));
+            session_deep_copy(&s_sessions[i], &s_active);
+            return;
+        }
+    }
+}
+
 const app_state_t *chat_engine_state(void) { return &s_state; }
 
 int chat_engine_init(void)
@@ -98,12 +117,12 @@ int chat_engine_init(void)
     }
     {
         ai_provider_t *p = &s_state.providers[s_state.provider_count++];
-        strncpy(p->id, PROVIDER_OLLAMA_ID, sizeof(p->id) - 1);
-        strncpy(p->name, PROVIDER_OLLAMA_NAME, sizeof(p->name) - 1);
-        strncpy(p->base_url, PROVIDER_OLLAMA_BASE_URL, sizeof(p->base_url) - 1);
-        strncpy(p->api_key, PROVIDER_OLLAMA_API_KEY, sizeof(p->api_key) - 1);
-        strncpy(p->model, PROVIDER_OLLAMA_MODEL, sizeof(p->model) - 1);
-        p->priority = PROVIDER_OLLAMA_PRIORITY;
+        strncpy(p->id, PROVIDER_LM_STUDIO_ID, sizeof(p->id) - 1);
+        strncpy(p->name, PROVIDER_LM_STUDIO_NAME, sizeof(p->name) - 1);
+        strncpy(p->base_url, PROVIDER_LM_STUDIO_BASE_URL, sizeof(p->base_url) - 1);
+        strncpy(p->api_key, PROVIDER_LM_STUDIO_API_KEY, sizeof(p->api_key) - 1);
+        strncpy(p->model, PROVIDER_LM_STUDIO_MODEL, sizeof(p->model) - 1);
+        p->priority = PROVIDER_LM_STUDIO_PRIORITY;
         p->enabled = true;
     }
     {
@@ -127,8 +146,8 @@ int chat_engine_init(void)
 
     /* Re-add any seeded providers that are missing from the saved state
      * (so newly added providers appear on existing devices too). */
-    const char *seed_ids[] = { PROVIDER_OPENCODE_ID, PROVIDER_OLLAMA_ID, PROVIDER_LAN_ID };
-    int seed_pri[3] = { PROVIDER_OPENCODE_PRIORITY, PROVIDER_OLLAMA_PRIORITY, PROVIDER_LAN_PRIORITY };
+    const char *seed_ids[] = { PROVIDER_OPENCODE_ID, PROVIDER_LM_STUDIO_ID, PROVIDER_LAN_ID };
+    int seed_pri[3] = { PROVIDER_OPENCODE_PRIORITY, PROVIDER_LM_STUDIO_PRIORITY, PROVIDER_LAN_PRIORITY };
     for (int i = 0; i < 3; i++) {
         ai_provider_t *found = chat_engine_find_provider(seed_ids[i]);
         if (!found && s_state.provider_count < APP_MAX_PROVIDERS) {
@@ -142,10 +161,10 @@ int chat_engine_init(void)
                 strncpy(slot->api_key, PROVIDER_OPENCODE_API_KEY, sizeof(slot->api_key) - 1);
                 strncpy(slot->model, PROVIDER_OPENCODE_MODEL, sizeof(slot->model) - 1);
             } else if (i == 1) {
-                strncpy(slot->name, PROVIDER_OLLAMA_NAME, sizeof(slot->name) - 1);
-                strncpy(slot->base_url, PROVIDER_OLLAMA_BASE_URL, sizeof(slot->base_url) - 1);
-                strncpy(slot->api_key, PROVIDER_OLLAMA_API_KEY, sizeof(slot->api_key) - 1);
-                strncpy(slot->model, PROVIDER_OLLAMA_MODEL, sizeof(slot->model) - 1);
+                strncpy(slot->name, PROVIDER_LM_STUDIO_NAME, sizeof(slot->name) - 1);
+                strncpy(slot->base_url, PROVIDER_LM_STUDIO_BASE_URL, sizeof(slot->base_url) - 1);
+                strncpy(slot->api_key, PROVIDER_LM_STUDIO_API_KEY, sizeof(slot->api_key) - 1);
+                strncpy(slot->model, PROVIDER_LM_STUDIO_MODEL, sizeof(slot->model) - 1);
             } else {
                 strncpy(slot->name, PROVIDER_LAN_NAME, sizeof(slot->name) - 1);
                 strncpy(slot->base_url, PROVIDER_LAN_BASE_URL, sizeof(slot->base_url) - 1);
@@ -155,6 +174,13 @@ int chat_engine_init(void)
             slot->priority = seed_pri[i];
             slot->enabled = true;
         }
+    }
+
+    /* Remove the deprecated Ollama Cloud provider if still present in the
+     * saved state (persisted on the SD card from older firmware). */
+    if (chat_engine_find_provider("ollama_cloud") != NULL) {
+        chat_engine_delete_provider("ollama_cloud");
+        ESP_LOGI(TAG, "removed deprecated provider 'ollama_cloud'");
     }
 
     /* Load sessions. */
@@ -314,6 +340,7 @@ int chat_engine_push_message(msg_role_t role, const char *text)
 
     chat_storage_save_session(&s_active);
     notify();
+    sync_active_to_list();
     return 0;
 }
 
@@ -428,11 +455,16 @@ static void engine_worker(void *arg)
         ESP_LOGI(TAG, "attempt %d provider %s", attempts, chain[i]->id);
         int rc = llm_openai_compatible(chain[i], s->messages, s->message_count, sys, &res);
         if (rc == 0) {
-            assistant_text = llm_parse_choices(res.body);
+            char *parsed = llm_parse_choices(res.body);
             llm_result_free(&res);
-            break;
+            if (parsed && parsed[0]) {
+                assistant_text = parsed;
+                break;
+            }
+            if (parsed) free(parsed);
+        } else if (res.body) {
+            llm_result_free(&res);
         }
-        if (res.body) llm_result_free(&res);
     }
 
     if (assistant_text) {
@@ -458,7 +490,7 @@ static void engine_worker(void *arg)
         gen_id(am->id, sizeof(am->id));
         am->role = MSG_ROLE_ASSISTANT;
         char err[256];
-        snprintf(err, sizeof(err), "⚠️ Error: all AI providers failed (%d attempts).", attempts);
+        snprintf(err, sizeof(err), "Error: all AI providers failed (%d attempts).", attempts);
         am->text = strdup(err);
         am->is_error = 1;
         s->message_count++;
@@ -469,6 +501,7 @@ static void engine_worker(void *arg)
     free(enriched);
     free(sys);
     free(user_text);
+    sync_active_to_list();
     s_busy = false;
     notify();
     vTaskDelete(NULL);
@@ -498,6 +531,55 @@ int chat_engine_send_user(const char *text, int web_search_enabled)
 
 bool chat_engine_is_busy(void) { return s_busy; }
 
+int chat_engine_retry_last(void)
+{
+    if (s_busy) return -1;
+    if (!s_active_loaded) return -1;
+    if (s_active.message_count < 2) return -1;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    chat_message_t *last = &s_active.messages[s_active.message_count - 1];
+    if (last->role != MSG_ROLE_ASSISTANT) { xSemaphoreGive(s_mutex); return -1; }
+
+    chat_message_t *user_msg = &s_active.messages[s_active.message_count - 2];
+    if (user_msg->role != MSG_ROLE_USER) { xSemaphoreGive(s_mutex); return -1; }
+
+    char *text = strdup(user_msg->text);
+
+    free(last->text);
+    memset(last, 0, sizeof(*last));
+    free(user_msg->text);
+    memset(user_msg, 0, sizeof(*user_msg));
+    s_active.message_count -= 2;
+
+    xSemaphoreGive(s_mutex);
+
+    chat_storage_save_session(&s_active);
+    sync_active_to_list();
+    notify();
+    return chat_engine_send_user(text, 0);
+}
+
+int chat_engine_clear_active(void)
+{
+    if (s_busy) return -1;
+    if (!s_active_loaded) return -1;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < s_active.message_count; i++) {
+        free(s_active.messages[i].text);
+        memset(&s_active.messages[i], 0, sizeof(s_active.messages[i]));
+    }
+    s_active.message_count = 0;
+    xSemaphoreGive(s_mutex);
+
+    chat_storage_save_session(&s_active);
+    sync_active_to_list();
+    notify();
+    return 0;
+}
+
 bool chat_engine_save_state_now(void) { return chat_storage_save_state(&s_state) == 0; }
 
 void chat_engine_update_system_prompt(const char *text)
@@ -507,6 +589,7 @@ void chat_engine_update_system_prompt(const char *text)
         strncpy(s_active.system_prompt, text, sizeof(s_active.system_prompt) - 1);
     }
     chat_engine_save_state_now();
+    sync_active_to_list();
     notify();
 }
 
@@ -648,7 +731,11 @@ static void test_tts_task(void *arg)
 {
     test_provider_arg_t *a = (test_provider_arg_t *)arg;
     char result[256];
-    int rc = tts_speak("Connection test from OmniChat", s_state.tts_volume);
+    const char *long_text = "Привет! Это тест озвучки OmniChat. "
+        "Данный текст специально сделан длинным, чтобы проверить "
+        "корректность воспроизведения аудио через FishTTS прокси. "
+        "Если вы слышите этот текст нормально, значит всё работает!";
+    int rc = tts_speak(long_text, s_state.tts_volume);
     if (rc == 0) snprintf(result, sizeof(result), "OK: TTS played a test phrase");
     else snprintf(result, sizeof(result), "FAIL: TTS playback error");
     if (a->cb) a->cb(result);

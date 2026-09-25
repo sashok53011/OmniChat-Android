@@ -27,6 +27,8 @@ static SemaphoreHandle_t s_result_mutex = NULL;
 static lv_obj_t *s_list = NULL;          /* main scroll content */
 static lv_obj_t *s_detail = NULL;        /* editor overlay (hidden by default) */
 static lv_obj_t *s_kbd = NULL;           /* shared on-screen keyboard */
+static lv_obj_t *s_lang_btn = NULL;      /* RU/EN toggle */
+static bool s_is_russian = false;
 static lv_obj_t *s_focus_ta = NULL;      /* textarea the keyboard targets */
 static lv_obj_t *s_status_label = NULL;  /* result of Test/connection (persistent) */
 static int s_editing_provider = -1;      /* index being edited, -1 = add */
@@ -155,11 +157,27 @@ static void kbd_show(void)
     if (!s_kbd) return;
     lv_obj_remove_flag(s_kbd, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_to_index(s_kbd, lv_obj_get_child_count(lv_obj_get_parent(s_kbd)) - 1);
+    if (s_lang_btn) lv_obj_remove_flag(s_lang_btn, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void kbd_hide(void)
 {
     if (s_kbd) lv_obj_add_flag(s_kbd, LV_OBJ_FLAG_HIDDEN);
+    if (s_lang_btn) lv_obj_add_flag(s_lang_btn, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void on_lang_toggle(lv_event_t *e)
+{
+    (void)e;
+    if (!s_kbd) return;
+    s_is_russian = !s_is_russian;
+    if (s_is_russian) {
+        lv_keyboard_set_mode(s_kbd, LV_KEYBOARD_MODE_USER_1);
+        lv_label_set_text(lv_obj_get_child(s_lang_btn, 0), "EN");
+    } else {
+        lv_keyboard_set_mode(s_kbd, LV_KEYBOARD_MODE_TEXT_LOWER);
+        lv_label_set_text(lv_obj_get_child(s_lang_btn, 0), "RU");
+    }
 }
 
 static void on_kbd_toggle(lv_event_t *e)
@@ -508,10 +526,20 @@ static void on_tts_test(lv_event_t *e)
 static void on_tts_speak_ai(lv_event_t *e)
 {
     const app_state_t *st = chat_engine_state();
-    /* Toggle speak_ai via a small switch-like button; simple toggle here. */
     chat_engine_set_tts_config(st->tts_url, st->tts_model, st->tts_voice, !st->tts_speak_ai);
     set_status(st->tts_speak_ai ? "Speak AI: On" : "Speak AI: Off");
     on_detail_back(NULL);
+}
+
+static void on_tts_volume_change(lv_event_t *e)
+{
+    lv_obj_t *slider = lv_event_get_target(e);
+    lv_obj_t *label = (lv_obj_t *)lv_event_get_user_data(e);
+    int vol = lv_slider_get_value(slider);
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d%%", vol);
+    lv_label_set_text(label, buf);
+    chat_engine_set_tts_volume(vol);
 }
 
 static void open_tts_editor(void)
@@ -560,6 +588,32 @@ static void open_tts_editor(void)
     lv_obj_center(tl2);
     lv_obj_set_style_text_font(tl2, APP_FONT_BODY, 0);
     lv_obj_add_event_cb(tgl, on_tts_speak_ai, LV_EVENT_CLICKED, NULL);
+
+    /* Volume slider */
+    lv_obj_t *vol_label = lv_label_create(s_detail);
+    lv_label_set_text(vol_label, "Volume");
+    lv_obj_set_pos(vol_label, 14, 310);
+    lv_obj_set_style_text_color(vol_label, lv_color_make(0xE6, 0xED, 0xF3), 0);
+    lv_obj_set_style_text_font(vol_label, APP_FONT_BODY, 0);
+
+    lv_obj_t *vol_val = lv_label_create(s_detail);
+    char vbuf[8];
+    snprintf(vbuf, sizeof(vbuf), "%d%%", st->tts_volume);
+    lv_label_set_text(vol_val, vbuf);
+    lv_obj_set_pos(vol_val, 420, 310);
+    lv_obj_set_style_text_color(vol_val, lv_color_make(0x58, 0xA6, 0xFF), 0);
+    lv_obj_set_style_text_font(vol_val, APP_FONT_BODY, 0);
+
+    lv_obj_t *slider = lv_slider_create(s_detail);
+    lv_obj_set_size(slider, 340, 20);
+    lv_obj_set_pos(slider, 60, 314);
+    lv_slider_set_range(slider, 0, 100);
+    lv_slider_set_value(slider, st->tts_volume, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(slider, lv_color_make(0x30, 0x36, 0x3D), 0);
+    lv_obj_set_style_bg_color(slider, lv_color_make(0x58, 0xA6, 0xFF), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(slider, lv_color_make(0xE6, 0xED, 0xF3), LV_PART_KNOB);
+
+    lv_obj_add_event_cb(slider, on_tts_volume_change, LV_EVENT_VALUE_CHANGED, vol_val);
 
 }
 
@@ -685,9 +739,53 @@ void ui_settings_init(lv_obj_t *parent, lv_display_t *disp)
     lv_obj_clear_flag(s_detail, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_detail, LV_OBJ_FLAG_HIDDEN);
 
-    /* Shared keyboard (hidden). */
+    /* Shared keyboard (hidden) — Cyrillic-capable font + Russian layout. */
+    extern const lv_font_t lv_font_md_body_20;
     s_kbd = lv_keyboard_create(parent);
+    lv_obj_set_style_text_font(s_kbd, &lv_font_md_body_20, 0);
     lv_obj_add_flag(s_kbd, LV_OBJ_FLAG_HIDDEN);
+
+    /* Russian keyboard layout (JCUKEN) */
+    static const char * const ru_kb_lc[] = {
+        "1#", "\xD1\x86", "\xD1\x83", "\xD0\xBA", "\xD0\xB5", "\xD0\xBD", "\xD0\xB3", "\xD1\x88", "\xD1\x89", "\xD0\xB7", "\xD1\x85", "\xD1\x8A", LV_SYMBOL_BACKSPACE, "\n",
+        "ABC", "\xD1\x84", "\xD1\x8B", "\xD0\xB2", "\xD0\xB0", "\xD0\xBF", "\xD1\x80", "\xD0\xBE", "\xD0\xBB", "\xD0\xB4", "\xD0\xB6", LV_SYMBOL_NEW_LINE, "\n",
+        "=", "\xD1\x8F", "\xD1\x87", "\xD1\x81", "\xD0\xBC", "\xD0\xB8", "\xD1\x82", "\xD1\x8C", "\xD0\xB1", "\xD1\x8E", ".", "?", "\n",
+        LV_SYMBOL_KEYBOARD, LV_SYMBOL_LEFT, " ", LV_SYMBOL_RIGHT, LV_SYMBOL_OK, ""
+    };
+    static const lv_buttonmatrix_ctrl_t ru_kb_ctrl_lc[] = {
+        LV_KEYBOARD_CTRL_BUTTON_FLAGS | 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 7,
+        LV_KEYBOARD_CTRL_BUTTON_FLAGS | 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 7,
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        LV_KEYBOARD_CTRL_BUTTON_FLAGS | 2, 4, 6, 4, 2
+    };
+    static const char * const ru_kb_uc[] = {
+        "1#", "\xD0\xA6", "\xD0\xA3", "\xD0\x9A", "\xD0\x95", "\xD0\x9D", "\xD0\x93", "\xD0\xA8", "\xD0\xA9", "\xD0\x97", "\xD0\xA5", "\xD0\xAA", LV_SYMBOL_BACKSPACE, "\n",
+        "abc", "\xD0\xA4", "\xD0\xAB", "\xD0\x92", "\xD0\x90", "\xD0\x9F", "\xD0\xA0", "\xD0\x9E", "\xD0\x9B", "\xD0\x94", "\xD0\x96", LV_SYMBOL_NEW_LINE, "\n",
+        "=", "\xD0\xAF", "\xD0\xA7", "\xD0\xA1", "\xD0\x9C", "\xD0\x98", "\xD0\xA2", "\xD0\xAC", "\xD0\x91", "\xD0\xAE", ".", "?", "\n",
+        LV_SYMBOL_KEYBOARD, LV_SYMBOL_LEFT, " ", LV_SYMBOL_RIGHT, LV_SYMBOL_OK, ""
+    };
+    static const lv_buttonmatrix_ctrl_t ru_kb_ctrl_uc[] = {
+        LV_KEYBOARD_CTRL_BUTTON_FLAGS | 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 7,
+        LV_KEYBOARD_CTRL_BUTTON_FLAGS | 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 7,
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        LV_KEYBOARD_CTRL_BUTTON_FLAGS | 2, 4, 6, 4, 2
+    };
+    lv_keyboard_set_map(s_kbd, LV_KEYBOARD_MODE_USER_1, ru_kb_lc, ru_kb_ctrl_lc);
+    lv_keyboard_set_map(s_kbd, LV_KEYBOARD_MODE_USER_2, ru_kb_uc, ru_kb_ctrl_uc);
+
+    /* RU/EN toggle button (shown/hidden with keyboard) */
+    s_lang_btn = lv_button_create(parent);
+    lv_obj_set_size(s_lang_btn, 60, 36);
+    lv_obj_set_pos(s_lang_btn, 10, 400);
+    lv_obj_set_style_bg_color(s_lang_btn, lv_color_make(0x26, 0x2C, 0x33), 0);
+    lv_obj_set_style_radius(s_lang_btn, 8, 0);
+    lv_obj_t *lang_lab = lv_label_create(s_lang_btn);
+    lv_label_set_text(lang_lab, "RU");
+    lv_obj_center(lang_lab);
+    lv_obj_set_style_text_color(lang_lab, lv_color_make(0xE6, 0xED, 0xF3), 0);
+    lv_obj_set_style_text_font(lang_lab, &lv_font_md_body_20, 0);
+    lv_obj_add_flag(s_lang_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_lang_btn, on_lang_toggle, LV_EVENT_CLICKED, NULL);
 
     /* Persistent status line (always visible, above the navbar). */
     lv_obj_t *status_wrap = lv_obj_create(parent);

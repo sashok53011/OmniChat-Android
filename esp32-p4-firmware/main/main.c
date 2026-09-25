@@ -1,10 +1,15 @@
 /*
  * main.c - OmniChat-P4 firmware entry point.
  *
- * Boot order:
- *   BSP display -> engine -> start LVGL task -> (in LVGL task) UI + WiFi + HTTP.
- * UI is created inside the LVGL task so lv_timer_handler is never blocked by
- * cross-thread LVGL calls.
+ * LVGL loop ownership: esp_lv_adapter (started inside bsp_display_start_with_config)
+ * owns lv_timer_handler() in its dedicated worker task. Nothing else may ever
+ * call lv_timer_handler() (double loops race the LVGL state machine, peg a core
+ * at 100% and wreck input/scroll handling). LVGL objects are touched only:
+ *   - inside the adapter worker (ui_pump_cb lv_timer), or
+ *   - under bsp_display_lock()/bsp_display_unlock() during initialization.
+ *
+ * Task lifecycle: one-shot init task does UI + WiFi + HTTP and deletes itself;
+ * app_main deletes itself too - no busy-idle loops.
  */
 #include <stdio.h>
 #include <string.h>
@@ -30,14 +35,17 @@ static void on_engine_change(void)
     ui_refresh();
 }
 
-/* LVGL task: init UI (on this thread), then tick + timer handler. */
-static void lvgl_task(void *arg)
+/* One-time init task: build the UI under the LVGL lock (so all lv_* calls run
+ * while the adapter worker is blocked on the same lock), then start WiFi + HTTP
+ * and leave. It must never call lv_timer_handler(). */
+static void init_task(void *arg)
 {
     (void)arg;
 
-    /* Build the UI on the same thread that owns lv_timer_handler. */
-    ESP_LOGI(TAG, "ui_init in lvgl task");
+    ESP_LOGI(TAG, "ui_init (under LVGL lock)");
+    bsp_display_lock(-1);
     ui_init(s_disp);
+    bsp_display_unlock();
     ESP_LOGI(TAG, "ui_init done");
 
     /* WiFi (non-blocking) + HTTP server. */
@@ -48,22 +56,30 @@ static void lvgl_task(void *arg)
     ESP_LOGI(TAG, "startup complete. Active provider: %s",
              st->active_provider_id ? st->active_provider_id : "-");
 
-    while (1) {
-        ui_pump();
-        uint32_t time_till_next = lv_timer_handler();
-        /* Yield to the scheduler: LVGL tells us when the next refresh is due.
-         * Clamp to a minimum so we never busy-spin and peg the CPU. */
-        if (time_till_next < 5 || time_till_next >= 0xFFFFFFFFu) time_till_next = 5;
-        vTaskDelay(pdMS_TO_TICKS(time_till_next));
-    }
+    vTaskDelete(NULL);
 }
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "OmniChat-P4 starting");
 
-    /* 1. BSP display. */
-    s_disp = bsp_display_start();
+    /* 1. BSP display. The esp_lv_adapter worker task starts here and owns
+     * lv_timer_handler() from this point on. Give it a roomier stack in PSRAM:
+     * our UI work (bubble/panel rebuilds) runs inside lv_timer_handler. */
+    bsp_display_cfg_t disp_cfg = {
+        .lv_adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG(),
+        .rotation = ESP_LV_ADAPTER_ROTATE_0,
+        .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_PARTIAL,
+        .touch_flags = {
+            .swap_xy = 0,
+            .mirror_x = 0,
+            .mirror_y = 0,
+        },
+    };
+    disp_cfg.lv_adapter_cfg.task_stack_size = 32 * 1024;
+    disp_cfg.lv_adapter_cfg.stack_in_psram = true;
+
+    s_disp = bsp_display_start_with_config(&disp_cfg);
     if (!s_disp) {
         ESP_LOGE(TAG, "display init failed");
         return;
@@ -74,11 +90,9 @@ void app_main(void)
     chat_engine_init();
     chat_engine_set_listener(on_engine_change);
 
-    /* 3. Start the LVGL task (it carries out UI + WiFi + HTTP). */
-    xTaskCreate(lvgl_task, "lvgl", 40 * 1024, NULL, 5, NULL);
+    /* 3. One-shot init task (UI + WiFi + HTTP). */
+    xTaskCreate(init_task, "init", 32 * 1024, NULL, 5, NULL);
 
-    /* main task just sleeps. */
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(10000));
-    }
+    /* The main task has nothing left to do - free it instead of spinning. */
+    vTaskDelete(NULL);
 }

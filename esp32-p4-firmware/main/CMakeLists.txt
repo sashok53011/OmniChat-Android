@@ -14,13 +14,13 @@ idf_component_register(
         "ui/ui_chat.c"
         "ui/ui_settings.c"
         "server/http_server.c"
-        "fonts/font_md_body_16.c"
-        "fonts/font_md_bold_16.c"
-        "fonts/font_md_italic_16.c"
-        "fonts/font_md_h1_26.c"
-        "fonts/font_md_h2_22.c"
-        "fonts/font_md_h3_20.c"
-        "fonts/font_md_code_14.c"
+        "fonts/lv_font_md_body_20.c"
+        "fonts/lv_font_md_bold_20.c"
+        "fonts/lv_font_md_italic_20.c"
+        "fonts/lv_font_md_h1_32.c"
+        "fonts/lv_font_md_h2_26.c"
+        "fonts/lv_font_md_h3_22.c"
+        "fonts/lv_font_md_code_16.c"
     INCLUDE_DIRS
         "."
         "chat"
@@ -41,7 +41,9 @@ idf_component_register(
         nvs_flash
         driver
         esp_lcd
-        spiffs
+        fatfs
+        esp_driver_sdspi
+        esp_driver_sdmmc
         json
         mbedtls
         esp-tls

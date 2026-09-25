@@ -32,6 +32,9 @@ interface AppDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertMessage(message: ChatMessage): Long
 
+    @Query("UPDATE chat_messages SET text = :text WHERE id = :messageId")
+    suspend fun updateMessageText(messageId: Long, text: String)
+
     @Delete
     suspend fun deleteMessage(message: ChatMessage)
 

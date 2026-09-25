@@ -94,25 +94,48 @@ static int http_post_raw(const char *url, const char *body, const char *auth,
     const char *s = strstr(url, "://");
     s = s ? s + 3 : url;
     const char *path = strchr(s, '/');
-    const char *pathEnd = path ? (path + strlen(path)) : "";
-    /* Build full request (header + body) into one buffer and send once. */
-    char req[1600];
+    if (!path) path = "/";
     int body_len = (int)strlen(body);
-    int hlen = snprintf(req, sizeof(req),
-        "POST %s HTTP/1.1\r\nHost: %s:%d\r\nContent-Type: application/json\r\n"
-        "Accept: application/json\r\nConnection: close\r\nContent-Length: %d\r\n",
-        path ? path : "/", host, port, body_len);
-    if (auth && auth[0]) {
-        hlen += snprintf(req + hlen, sizeof(req) - hlen, "Authorization: %s", auth);
-    }
-    hlen += snprintf(req + hlen, sizeof(req) - hlen, "\r\n");
-    (void)pathEnd;
-    if (hlen <= 0 || hlen >= (int)sizeof(req) - body_len - 1) { close(fd); return -1; }
-    memcpy(req + hlen, body, body_len + 1);
-    int total_req = hlen + body_len;
 
-    if (send(fd, req, total_req, 0) < 0) { ESP_LOGE(TAG, "http_raw: send failed"); close(fd); return -1; }
-    ESP_LOGI(TAG, "http_raw: sent %d bytes to %s:%d", total_req, host, port);
+    /* Header only (no body), so it can never overflow regardless of history.
+     * Host header must omit the port for standard ports (80/443) — otherwise
+     * SNI sends "host:port" and the TLS cert CN/SAN check fails (-0x3000). */
+    char hdr[512];
+    int is_standard_port = ((port == 80) || (port == 443));
+    int hlen;
+    if (is_standard_port) {
+        hlen = snprintf(hdr, sizeof(hdr),
+            "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\n"
+            "Accept: application/json\r\nConnection: close\r\nContent-Length: %d\r\n",
+            path, host, body_len);
+    } else {
+        hlen = snprintf(hdr, sizeof(hdr),
+            "POST %s HTTP/1.1\r\nHost: %s:%d\r\nContent-Type: application/json\r\n"
+            "Accept: application/json\r\nConnection: close\r\nContent-Length: %d\r\n",
+            path, host, port, body_len);
+    }
+    if (auth && auth[0]) {
+        hlen += snprintf(hdr + hlen, sizeof(hdr) - hlen, "Authorization: %s\r\n", auth);
+    }
+    hlen += snprintf(hdr + hlen, sizeof(hdr) - hlen, "\r\n");
+    if (hlen <= 0 || hlen >= (int)sizeof(hdr)) { close(fd); return -1; }
+
+    /* Headers + body in one dynamic buffer, sent in a single write. */
+    size_t total_req = (size_t)hlen + (size_t)body_len;
+    char *req = malloc(total_req + 1);
+    if (!req) { close(fd); return -1; }
+    memcpy(req, hdr, hlen);
+    memcpy(req + hlen, body, body_len);
+    req[total_req] = '\0';
+
+    if (send(fd, req, total_req, 0) < 0) {
+        ESP_LOGE(TAG, "http_raw: send failed");
+        free(req);
+        close(fd);
+        return -1;
+    }
+    ESP_LOGI(TAG, "http_raw: sent %d bytes to %s:%d", (int)total_req, host, port);
+    free(req);
 
     /* Read until close (with a bounded timeout so we never block forever). */
     int cap = APP_MAX_RESPONSE;
@@ -174,19 +197,39 @@ static int https_post_raw(const char *url, const char *body, const char *auth,
     const char *s = strstr(url, "://"); s = s ? s + 3 : url;
     const char *path = strchr(s, '/');
     if (!path) path = "/";
-    char req[1600];
     int body_len = (int)strlen(body);
-    int n = snprintf(req, sizeof(req),
-        "POST %s HTTP/1.1\r\nHost: %s:%d\r\nContent-Type: application/json\r\n"
-        "Accept: application/json\r\nConnection: close\r\nContent-Length: %d\r\n",
-        path, host, port, body_len);
-    if (auth && auth[0]) n += snprintf(req + n, sizeof(req) - n, "Authorization: %s", auth);
-    n += snprintf(req + n, sizeof(req) - n, "\r\n");
-    if (n <= 0 || n >= (int)sizeof(req) - body_len - 1) { esp_tls_conn_destroy(tls); return -1; }
-    memcpy(req + n, body, body_len + 1);
-    int total_req = n + body_len;
+
+    /* Header only (no body), so it can never overflow regardless of history.
+     * Host header must omit the port for standard ports (80/443) — otherwise
+     * SNI sends "host:port" and the TLS cert CN/SAN check fails (-0x3000). */
+    char hdr[512];
+    int is_standard_port = ((port == 80) || (port == 443));
+    int n;
+    if (is_standard_port) {
+        n = snprintf(hdr, sizeof(hdr),
+            "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\n"
+            "Accept: application/json\r\nConnection: close\r\nContent-Length: %d\r\n",
+            path, host, body_len);
+    } else {
+        n = snprintf(hdr, sizeof(hdr),
+            "POST %s HTTP/1.1\r\nHost: %s:%d\r\nContent-Type: application/json\r\n"
+            "Accept: application/json\r\nConnection: close\r\nContent-Length: %d\r\n",
+            path, host, port, body_len);
+    }
+    if (auth && auth[0]) n += snprintf(hdr + n, sizeof(hdr) - n, "Authorization: %s\r\n", auth);
+    n += snprintf(hdr + n, sizeof(hdr) - n, "\r\n");
+    if (n <= 0 || n >= (int)sizeof(hdr)) { esp_tls_conn_destroy(tls); return -1; }
+
+    /* Headers + body in one dynamic buffer, sent in a single write. */
+    size_t total_req = (size_t)n + (size_t)body_len;
+    char *req = malloc(total_req + 1);
+    if (!req) { esp_tls_conn_destroy(tls); return -1; }
+    memcpy(req, hdr, n);
+    memcpy(req + n, body, body_len);
+    req[total_req] = '\0';
 
     int written = esp_tls_conn_write(tls, req, total_req);
+    free(req);
     if (written < 0) { ESP_LOGE(TAG, "https_raw: write failed"); esp_tls_conn_destroy(tls); return -1; }
 
     int cap = APP_MAX_RESPONSE;
@@ -225,7 +268,11 @@ static void build_body(const char *model, const chat_message_t *messages,
     }
 
     for (int i = 0; i < message_count; i++) {
+        /* Skip system and error bubbles: error text (e.g. "all AI providers
+         * failed") must never be sent back to a model, or it gets echoed into
+         * future responses and poisons the conversation history. */
         if (messages[i].role == MSG_ROLE_SYSTEM) continue;
+        if (messages[i].is_error) continue;
         const char *role = (messages[i].role == MSG_ROLE_USER) ? "user" : "assistant";
         cJSON *m = cJSON_CreateObject();
         cJSON_AddStringToObject(m, "role", role);
@@ -249,13 +296,20 @@ int llm_openai_compatible(const ai_provider_t *provider,
     memset(out, 0, sizeof(*out));
 
     char url[256];
-    /* Normalize: if base_url ends with '/' append "chat/completions". */
+    /* Normalize: if base_url ends with '/' append "chat/completions", else
+     * insert a '/' separator (base must not be joined without it). */
     const char *base = provider->base_url[0] ? provider->base_url : "";
     if (strstr(base, "chat/completions")) {
         snprintf(url, sizeof(url), "%s", base);
     } else {
-        snprintf(url, sizeof(url), "%schat/completions", base);
+        size_t bl = strlen(base);
+        if (bl > 0 && base[bl - 1] == '/') {
+            snprintf(url, sizeof(url), "%schat/completions", base);
+        } else {
+            snprintf(url, sizeof(url), "%s/chat/completions", base);
+        }
     }
+    probe_connect(url);
 
     char *body = NULL;
     int body_len = 0;
@@ -394,8 +448,17 @@ char *llm_parse_choices(const char *json_body)
         cJSON *first = cJSON_GetArrayItem(choices, 0);
         cJSON *msg = cJSON_GetObjectItem(first, "message");
         cJSON *content = cJSON_GetObjectItem(msg, "content");
-        if (content && content->valuestring) {
+        if (content && content->valuestring && content->valuestring[0]) {
             text = content->valuestring;
+        } else {
+            /* Reasoning models (qwen3-vl, deepseek, etc.) often emit only
+             * "reasoning_content" (thought) with an empty "content" when they
+             * answer purely with reasoning. Fall back to it so such replies
+             * are not mistaken for failures/empty responses. */
+            cJSON *reasoning = cJSON_GetObjectItem(msg, "reasoning_content");
+            if (reasoning && reasoning->valuestring && reasoning->valuestring[0]) {
+                text = reasoning->valuestring;
+            }
         }
     }
     char *out = text ? strdup(text) : NULL;

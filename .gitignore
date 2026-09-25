@@ -16,3 +16,14 @@
 local.properties
 .env
 debug.keystore
+
+# ESP-IDF managed components (use idf.py reconfigure to fetch)
+**/managed_components/
+**/dependencies.lock
+
+# Hermes agent temp files
+**/.hermes-tmp.*
+
+# Build directories
+**/build/
+**/build2/

@@ -392,6 +392,8 @@ fun ChatTabScreen(viewModel: MainViewModel, lang: String, drawerState: DrawerSta
     val messages by viewModel.currentMessages.collectAsStateWithLifecycle()
     val isGenerating by viewModel.isGenerating.collectAsStateWithLifecycle()
     val statusText by viewModel.statusText.collectAsStateWithLifecycle()
+    val streamingText by viewModel.streamingText.collectAsStateWithLifecycle()
+    val isStreamingActive by viewModel.isStreamingActive.collectAsStateWithLifecycle()
     val isListening by viewModel.isListening.collectAsStateWithLifecycle()
     val continueListeningMode by viewModel.continueListeningMode.collectAsStateWithLifecycle()
     val voiceMessageQueue by viewModel.voiceMessageQueue.collectAsStateWithLifecycle()
@@ -467,10 +469,10 @@ fun ChatTabScreen(viewModel: MainViewModel, lang: String, drawerState: DrawerSta
     var textInput by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
 
-    // Scroll to bottom on new message
-    LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) {
-            listState.animateScrollToItem(messages.size - 1)
+    // Scroll to bottom on new message or streaming text update
+    LaunchedEffect(messages.size, streamingText) {
+        if (listState.layoutInfo.totalItemsCount > 0) {
+            listState.animateScrollToItem(listState.layoutInfo.totalItemsCount - 1)
         }
     }
 
@@ -863,29 +865,33 @@ fun ChatTabScreen(viewModel: MainViewModel, lang: String, drawerState: DrawerSta
                         )
                     )
 
-                    // Send button — inline, circular, inside the row
+                    // Send / Stop button — inline, circular, inside the row
                     IconButton(
                         onClick = {
-                            if (textInput.isNotBlank()) {
+                            if (isGenerating) {
+                                viewModel.stopGeneration()
+                            } else if (textInput.isNotBlank()) {
                                 viewModel.sendMessage(textInput)
                                 textInput = ""
                             }
                         },
-                        enabled = textInput.isNotBlank() && !isGenerating,
+                        enabled = isGenerating || textInput.isNotBlank(),
                         modifier = Modifier
                             .size(40.dp)
                             .clip(CircleShape)
                             .background(
-                                if (textInput.isNotBlank() && !isGenerating)
+                                if (isGenerating)
+                                    MaterialTheme.colorScheme.error
+                                else if (textInput.isNotBlank())
                                     MaterialTheme.colorScheme.primary
                                 else
                                     MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
                             )
                     ) {
                         Icon(
-                            Icons.Filled.Send,
-                            contentDescription = "Send",
-                            tint = if (textInput.isNotBlank() && !isGenerating)
+                            if (isGenerating) Icons.Filled.Close else Icons.Filled.Send,
+                            contentDescription = if (isGenerating) "Stop" else "Send",
+                            tint = if (isGenerating || textInput.isNotBlank())
                                 MaterialTheme.colorScheme.onPrimary
                             else
                                 MaterialTheme.colorScheme.onSurface.copy(alpha = 0.25f),
@@ -1181,6 +1187,21 @@ fun ChatTabScreen(viewModel: MainViewModel, lang: String, drawerState: DrawerSta
         ) {
             items(messages) { message ->
                 MessageBubble(message = message, viewModel = viewModel, lang = lang)
+            }
+
+            // Streaming message in progress (appears before typing indicator)
+            if (isStreamingActive && streamingText.isNotEmpty()) {
+                item {
+                    MessageBubble(
+                        message = ChatMessage(
+                            sessionId = 0,
+                            role = "model",
+                            text = streamingText
+                        ),
+                        viewModel = viewModel,
+                        lang = lang
+                    )
+                }
             }
 
             // Typing Indicator

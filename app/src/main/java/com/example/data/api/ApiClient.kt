@@ -10,6 +10,9 @@ import android.util.Log
 import com.example.BuildConfig
 import com.example.data.model.ChatMessage
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -28,6 +31,12 @@ object ApiClient {
     private val client = OkHttpClient.Builder()
         .connectTimeout(60, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
+        .build()
+
+    private val streamingClient = OkHttpClient.Builder()
+        .connectTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(300, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
         .build()
 
@@ -338,11 +347,15 @@ object ApiClient {
             val requestBodyJson = root.toString()
             val requestBody = requestBodyJson.toRequestBody(JSON_MEDIA_TYPE)
 
-            val request = Request.Builder()
+            val requestBuilder = Request.Builder()
                 .url(cleanUrl)
-                .addHeader("Authorization", "Bearer $apiKey")
                 .post(requestBody)
-                .build()
+
+            if (apiKey.isNotBlank()) {
+                requestBuilder.addHeader("Authorization", "Bearer $apiKey")
+            }
+
+            val request = requestBuilder.build()
 
             client.newCall(request).execute().use { response ->
                 val responseBody = response.body?.string() ?: ""
@@ -364,6 +377,172 @@ object ApiClient {
         } catch (e: Exception) {
             Log.e(TAG, "callOpenAi failed on URL $cleanUrl", e)
             throw e
+        }
+    }
+
+    // Stream OpenAI Compatible API — emits text deltas as Flow<String>
+    fun callOpenAiStreaming(
+        context: Context,
+        baseUrl: String,
+        apiKey: String,
+        modelName: String,
+        messages: List<ChatMessage>,
+        systemInstruction: String?,
+        attachments: List<Uri> = emptyList()
+    ): Flow<String> = callbackFlow {
+        val trimmed = baseUrl.trim()
+        val cleanUrl = if (trimmed.endsWith("chat/completions")) {
+            trimmed
+        } else if (trimmed.endsWith("chat/completions/")) {
+            trimmed.removeSuffix("/")
+        } else {
+            val base = if (trimmed.endsWith("/")) trimmed else "$trimmed/"
+            base + "chat/completions"
+        }
+
+        try {
+            val root = JSONObject()
+            root.put("model", modelName.ifBlank { "gpt-4o-mini" })
+            root.put("stream", true)
+
+            val messagesArray = JSONArray()
+
+            if (!systemInstruction.isNullOrBlank()) {
+                messagesArray.put(
+                    JSONObject()
+                        .put("role", "system")
+                        .put("content", systemInstruction)
+                )
+            }
+
+            messages.forEachIndexed { index, msg ->
+                val msgObj = JSONObject()
+                val roleName = if (msg.role == "model") "assistant" else msg.role
+                msgObj.put("role", roleName)
+
+                if (msg.role == "user" && index == messages.lastIndex && attachments.isNotEmpty()) {
+                    val contentArray = JSONArray()
+                    contentArray.put(JSONObject().put("type", "text").put("text", msg.text))
+
+                    attachments.forEach { uri ->
+                        val mimeType = context.contentResolver.getType(uri) ?: "image/jpeg"
+                        if (mimeType.startsWith("image/")) {
+                            uriToBitmap(context, uri)?.let { bitmap ->
+                                val base64 = bitmapToBase64(bitmap)
+                                val imgUrlObj = JSONObject().put("url", "data:image/jpeg;base64,$base64")
+                                val item = JSONObject().put("type", "image_url").put("image_url", imgUrlObj)
+                                contentArray.put(item)
+                            }
+                        } else if (mimeType.startsWith("video/")) {
+                            val frames = extractVideoFrames(context, uri, 3)
+                            frames.forEach { bitmap ->
+                                val base64 = bitmapToBase64(bitmap)
+                                val imgUrlObj = JSONObject().put("url", "data:image/jpeg;base64,$base64")
+                                val item = JSONObject().put("type", "image_url").put("image_url", imgUrlObj)
+                                contentArray.put(item)
+                            }
+                        } else if (mimeType.startsWith("audio/")) {
+                            try {
+                                val inputStream = context.contentResolver.openInputStream(uri)
+                                val audioBytes = inputStream?.use { it.readBytes() }
+                                if (audioBytes != null && audioBytes.isNotEmpty()) {
+                                    val base64 = android.util.Base64.encodeToString(audioBytes, android.util.Base64.NO_WRAP)
+                                    val format = when {
+                                        mimeType.contains("wav") -> "wav"
+                                        mimeType.contains("mp3") -> "mp3"
+                                        mimeType.contains("ogg") -> "ogg"
+                                        mimeType.contains("flac") -> "flac"
+                                        else -> "mp3"
+                                    }
+                                    val audioObj = JSONObject().put("data", base64).put("format", format)
+                                    val item = JSONObject().put("type", "input_audio").put("input_audio", audioObj)
+                                    contentArray.put(item)
+                                }
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Failed reading audio attachment in streaming payload", e)
+                            }
+                        } else {
+                            try {
+                                val inputStream = context.contentResolver.openInputStream(uri)
+                                val textContent = inputStream?.bufferedReader()?.use { it.readText() } ?: ""
+                                if (textContent.isNotBlank()) {
+                                    contentArray.put(
+                                        JSONObject().put("type", "text").put("text", "\n\n[Attached File]:\n$textContent")
+                                    )
+                                }
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Failed reading text attachment in streaming payload", e)
+                            }
+                        }
+                    }
+                    msgObj.put("content", contentArray)
+                } else {
+                    msgObj.put("content", msg.text)
+                }
+
+                messagesArray.put(msgObj)
+            }
+
+            root.put("messages", messagesArray)
+
+            val requestBody = root.toString().toRequestBody(JSON_MEDIA_TYPE)
+
+            val requestBuilder = Request.Builder()
+                .url(cleanUrl)
+                .post(requestBody)
+
+            if (apiKey.isNotBlank()) {
+                requestBuilder.addHeader("Authorization", "Bearer $apiKey")
+            }
+
+            val request = requestBuilder.build()
+            val call = streamingClient.newCall(request)
+
+            try {
+                val response = call.execute()
+                if (!response.isSuccessful) {
+                    val errorBody = response.body?.string() ?: ""
+                    close(Exception("OpenAI streaming API Error ${response.code}: $errorBody"))
+                    return@callbackFlow
+                }
+
+                val source = response.body?.source() ?: run {
+                    close(Exception("Empty streaming response body"))
+                    return@callbackFlow
+                }
+
+                while (!source.exhausted()) {
+                    val line = source.readUtf8Line() ?: continue
+                    if (line.startsWith("data: ")) {
+                        val data = line.removePrefix("data: ").trim()
+                        if (data == "[DONE]") break
+                        try {
+                            val json = JSONObject(data)
+                            val choices = json.optJSONArray("choices")
+                            if (choices != null && choices.length() > 0) {
+                                val delta = choices.getJSONObject(0).optJSONObject("delta")
+                                val content = delta?.optString("content", "")?.let { if (it == "null") "" else it }
+                                if (!content.isNullOrEmpty()) {
+                                    trySend(content)
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to parse SSE chunk: $data", e)
+                        }
+                    }
+                }
+                close()
+            } catch (e: Exception) {
+                Log.e(TAG, "callOpenAiStreaming failed on URL $cleanUrl", e)
+                close(e)
+            }
+
+            awaitClose {
+                call.cancel()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "callOpenAiStreaming setup failed", e)
+            close(e)
         }
     }
 

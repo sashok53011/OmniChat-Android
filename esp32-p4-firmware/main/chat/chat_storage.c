@@ -1,9 +1,16 @@
 /*
- * chat_storage.c - SPIFFS persistence of OmniChat-P4 state using cJSON.
+ * chat_storage.c - uSD card persistence of OmniChat-P4 state using cJSON.
  *
- * Layout:
- *   /storage/state.json   -> providers, config, memory
- *   /storage/sessions/<id>.json -> one file per chat session
+ * Layout (FAT on the uSD card, mounted at /sdcard):
+ *   /sdcard/omnichat/state.json   -> providers, config, memory
+ *   /sdcard/omnichat/sessions/<id>.json -> one file per chat session
+ *
+ * The card is formatted (FAT) automatically if it cannot be mounted, so a
+ * brand-new or corrupted card is made usable on the first boot.
+ *
+ * NOTE: the P4 has a single SDMMC controller, and the WiFi module (ESP32-C6
+ * via ESP-Hosted) claims it during startup. The microSD card is therefore
+ * driven over SPI on its own pins (CLK=43, CMD=44, D0=39; DAT3 works as CS).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,18 +20,85 @@
 #include <sys/fcntl.h>
 #include <dirent.h>
 #include "esp_log.h"
-#include "esp_spiffs.h"
+#include "esp_vfs_fat.h"
+#include "driver/spi_common.h"
+#include "driver/sdspi_host.h"
+#include "driver/sdmmc_types.h"
 #include "cJSON.h"
 #include "chat_storage.h"
 #include "app_config.h"
+#include "bsp/esp32_p4_wifi6_touch_lcd_4b.h"
 
 static const char *TAG = "chat_storage";
 
-#define STORAGE_PATH   "/storage"
+#define STORAGE_PATH   "/sdcard/omnichat"
 #define STATE_FILE     STORAGE_PATH "/state.json"
 #define SESSIONS_DIR   STORAGE_PATH "/sessions"
 
 static bool s_mounted = false;
+static sdmmc_card_t *s_card = NULL;
+
+/* Mount the uSD card over SPI (FAT, format if mount fails).
+ *
+ * The ESP32-C6 WiFi module (ESP-Hosted) grabs the P4's only SDMMC controller
+ * during startup, so the microSD card cannot use SDMMC slot 0 while WiFi is
+ * active. Instead we talk to the card in SPI mode on its own pins:
+ *   BSP_SD_CLK=43 -> SCLK,  BSP_SD_CMD=44 -> MOSI,
+ *   BSP_SD_D0=39  -> MISO,  BSP_SD_D3=42  -> CS.
+ *
+ * We deliberately do NOT call bsp_sdcard_mount(): besides the SDMMC conflict,
+ * it would re-acquire the VO4 LDO channel that bsp_display_start() already
+ * holds. The 3.3 V rail is powered from the display init. */
+static int mount_sd(void)
+{
+    if (s_mounted) {
+        return 0;
+    }
+
+    const spi_host_device_t spi_host = SPI3_HOST;
+
+    spi_bus_config_t bus_cfg = {
+        .sclk_io_num = BSP_SD_CLK,
+        .mosi_io_num = BSP_SD_CMD,
+        .miso_io_num = BSP_SD_D0,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4096,
+    };
+    esp_err_t err = spi_bus_initialize(spi_host, &bus_cfg, SPI_DMA_CH_AUTO);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SD SPI bus init failed: %s", esp_err_to_name(err));
+        return -1;
+    }
+
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = spi_host;
+    host.max_freq_khz = 5000;
+
+    sdspi_device_config_t slot_cfg = {
+        .host_id = spi_host,
+        .gpio_cs = BSP_SD_D3,
+        .gpio_cd = SDSPI_SLOT_NO_CD,
+        .gpio_wp = SDSPI_SLOT_NO_WP,
+        .gpio_int = SDSPI_SLOT_NO_INT,
+    };
+
+    esp_vfs_fat_mount_config_t mount_config = {
+        .format_if_mount_failed = true,
+        .max_files = 10,
+        .allocation_unit_size = 64 * 1024,
+    };
+
+    err = esp_vfs_fat_sdspi_mount("/sdcard", &host, &slot_cfg,
+                                  &mount_config, &s_card);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SD card mount failed: %s", esp_err_to_name(err));
+        return -1;
+    }
+
+    ESP_LOGI(TAG, "uSD mounted (SPI): %s", s_card ? s_card->cid.name : "?");
+    return 0;
+}
 
 void chat_session_init(chat_session_t *s)
 {
@@ -54,13 +128,28 @@ static void ensure_dir(const char *path)
 
 static int write_file(const char *path, const char *data)
 {
-    FILE *f = fopen(path, "w");
+    if (!s_mounted) {
+        return -1;
+    }
+    /* Best-effort atomic write: write to a temp file, then move it over the
+     * target. FATFS cannot rename over an existing target (f_rename -> FR_EXIST),
+     * so the destination is unlinked first. A power cut in between leaves no
+     * file at all, which is safer than a half-written one. */
+    char tmp[192];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
     if (!f) {
-        ESP_LOGE(TAG, "cannot open %s", path);
+        ESP_LOGE(TAG, "cannot open %s", tmp);
         return -1;
     }
     fputs(data, f);
     fclose(f);
+    unlink(path);
+    if (rename(tmp, path) != 0) {
+        ESP_LOGE(TAG, "rename %s -> %s failed", tmp, path);
+        unlink(tmp);
+        return -1;
+    }
     return 0;
 }
 
@@ -90,20 +179,15 @@ int chat_storage_init(void)
     if (s_mounted) {
         return 0;
     }
-    esp_vfs_spiffs_conf_t conf = {
-        .base_path = STORAGE_PATH,
-        .partition_label = "storage",
-        .max_files = 10,
-        .format_if_mount_failed = true
-    };
-    esp_err_t err = esp_vfs_spiffs_register(&conf);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SPIFFS register failed: %s", esp_err_to_name(err));
+    if (mount_sd() != 0) {
+        /* No card (or format failed). Keep going without persistence. */
+        s_mounted = false;
         return -1;
     }
+    ensure_dir(STORAGE_PATH);
     ensure_dir(SESSIONS_DIR);
     s_mounted = true;
-    ESP_LOGI(TAG, "SPIFFS mounted at %s", STORAGE_PATH);
+    ESP_LOGI(TAG, "storage ready at %s", STORAGE_PATH);
     return 0;
 }
 
@@ -125,14 +209,19 @@ static void add_provider(cJSON *arr, const ai_provider_t *p)
 static void read_provider(const cJSON *o, ai_provider_t *p)
 {
     memset(p, 0, sizeof(*p));
-    const char *s;
-    if ((s = cJSON_GetObjectItem(o, "id")->valuestring)) strncpy(p->id, s, sizeof(p->id) - 1);
-    if ((s = cJSON_GetObjectItem(o, "name")->valuestring)) strncpy(p->name, s, sizeof(p->name) - 1);
-    if ((s = cJSON_GetObjectItem(o, "base_url")->valuestring)) strncpy(p->base_url, s, sizeof(p->base_url) - 1);
-    if ((s = cJSON_GetObjectItem(o, "api_key")->valuestring)) strncpy(p->api_key, s, sizeof(p->api_key) - 1);
-    if ((s = cJSON_GetObjectItem(o, "model")->valuestring)) strncpy(p->model, s, sizeof(p->model) - 1);
-    cJSON *n = cJSON_GetObjectItem(o, "priority");
-    if (n) p->priority = n->valueint;
+    const cJSON *n;
+    if ((n = cJSON_GetObjectItem(o, "id")) && n->valuestring)
+        strncpy(p->id, n->valuestring, sizeof(p->id) - 1);
+    if ((n = cJSON_GetObjectItem(o, "name")) && n->valuestring)
+        strncpy(p->name, n->valuestring, sizeof(p->name) - 1);
+    if ((n = cJSON_GetObjectItem(o, "base_url")) && n->valuestring)
+        strncpy(p->base_url, n->valuestring, sizeof(p->base_url) - 1);
+    if ((n = cJSON_GetObjectItem(o, "api_key")) && n->valuestring)
+        strncpy(p->api_key, n->valuestring, sizeof(p->api_key) - 1);
+    if ((n = cJSON_GetObjectItem(o, "model")) && n->valuestring)
+        strncpy(p->model, n->valuestring, sizeof(p->model) - 1);
+    cJSON *prio = cJSON_GetObjectItem(o, "priority");
+    if (prio) p->priority = prio->valueint;
     cJSON *b = cJSON_GetObjectItem(o, "enabled");
     if (b) p->enabled = cJSON_IsTrue(b);
 }
